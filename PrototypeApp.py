@@ -6,7 +6,7 @@ from email_actions import render_email_draft_popup
 
 # CONFIG
 
-API_URL = "aura-api-production-21e5.up.railway.app/predict"
+API_URL = "https://aura-api-production-21e5.up.railway.app/predict"
 
 st.set_page_config(
     page_title="AURA – Churn Risk & Lead-Time Prototype",
