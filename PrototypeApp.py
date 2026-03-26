@@ -33,7 +33,7 @@ Predictions are served via **FastAPI** and visualised here in **Streamlit**.
 
 @st.cache_data
 def load_data():
-    df = pd.read_csv("AURA_cloud_user_dataset.csv")
+    df = pd.read_csv("AURA_poc_dataset_100users.csv")
     df["date"] = pd.to_datetime(df["date"])
     return df
 
