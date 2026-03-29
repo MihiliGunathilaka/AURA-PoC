@@ -1,6 +1,10 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
+import joblib
+import shap
+import matplotlib.pyplot as plt
 from email_actions import render_email_draft_popup
 
 
@@ -40,6 +44,21 @@ def load_data():
 df = load_data()
 st.success("Raw behavioural dataset loaded")
 
+# LOAD SHAP EXPLAINER
+
+@st.cache_resource
+def load_shap_explainer():
+    try:
+        explainer = joblib.load("AURA_shap_explainer.pkl")
+        model = joblib.load("AURA_xgboost_model.pkl")
+        with open("AURA_feature_names.txt") as f:
+            feature_names = [l.strip() for l in f if l.strip()]
+        return explainer, model, feature_names
+    except Exception as e:
+        st.warning(f"SHAP explainer not available: {e}")
+        return None, None, None
+
+shap_explainer, local_model, shap_feature_names = load_shap_explainer()
 
 # SIDEBAR – USER SELECTION
 
@@ -194,6 +213,86 @@ else:
 st.write("### Risk Probabilities")
 st.json(probabilities)
 
+# SHAP FEATURE IMPORTANCE (MODEL EXPLAINABILITY)
+
+st.subheader("Why This Prediction? — Feature Importance (SHAP)")
+
+if shap_explainer is not None and local_model is not None and shap_feature_names is not None:
+    try:
+        # Build the same feature vector used for Model 1 prediction
+        snapshot_data = payload.copy()
+        row = []
+        for feat in shap_feature_names:
+            if feat.startswith("region_"):
+                row.append(1.0 if snapshot_data["region"] == feat.replace("region_", "") else 0.0)
+            elif feat.startswith("subscription_tier_"):
+                row.append(1.0 if snapshot_data["subscription_tier"] == feat.replace("subscription_tier_", "") else 0.0)
+            else:
+                row.append(float(snapshot_data.get(feat, 0.0)))
+
+        X_shap = pd.DataFrame([row], columns=shap_feature_names)
+
+        # Get SHAP values
+        shap_values = shap_explainer.shap_values(X_shap)
+
+        # Get the predicted class index
+        predicted_class_idx = {"Safe": 0, "Warning": 1, "At-Risk": 2}[predicted_state]
+
+        # Get SHAP values for the predicted class
+        if isinstance(shap_values, list):
+            # Multi-class: list of arrays, one per class
+            class_shap = np.array(shap_values[predicted_class_idx]).flatten()
+        elif shap_values.ndim == 3:
+            # Shape: (1, num_features, num_classes)
+            class_shap = shap_values[0, :, predicted_class_idx].flatten()
+        elif shap_values.ndim == 2:
+            # Shape: (1, num_features)
+            class_shap = shap_values[0].flatten()
+        else:
+            class_shap = np.array(shap_values).flatten()
+
+        # Create feature importance DataFrame
+        importance_df = pd.DataFrame({
+            "Feature": shap_feature_names,
+            "SHAP Value": class_shap
+        })
+        importance_df["Absolute Impact"] = importance_df["SHAP Value"].abs()
+        importance_df = importance_df.sort_values("Absolute Impact", ascending=False).head(10)
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(10, 5))
+        colors = ["#E74C3C" if v < 0 else "#27AE60" for v in importance_df["SHAP Value"]]
+        ax.barh(
+            range(len(importance_df)),
+            importance_df["SHAP Value"].values,
+            color=colors,
+            edgecolor="none",
+            height=0.6
+        )
+        ax.set_yticks(range(len(importance_df)))
+        ax.set_yticklabels(importance_df["Feature"].values, fontsize=10)
+        ax.set_xlabel("SHAP Value (impact on prediction)", fontsize=11)
+        ax.set_title(f"Top 10 features driving '{predicted_state}' prediction", fontsize=13, fontweight="bold")
+        ax.invert_yaxis()
+        ax.axvline(x=0, color="gray", linewidth=0.5, linestyle="--")
+        ax.grid(axis="x", alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # Plain language explanation
+        top_feature = importance_df.iloc[0]
+        direction = "increases" if top_feature["SHAP Value"] > 0 else "decreases"
+        st.caption(
+            f"The strongest driver is **{top_feature['Feature']}** which {direction} "
+            f"the likelihood of being classified as **{predicted_state}**. "
+            f"Green bars push toward this class, red bars push away from it."
+        )
+
+    except Exception as e:
+        st.warning(f"SHAP explanation unavailable: {e}")
+else:
+    st.info("SHAP explainer not loaded — feature importance unavailable.")
 
 # LEAD-TIME TO CHURN SECTION (MODEL 2)
 
@@ -218,18 +317,32 @@ if lead_time is not None:
         f"{ci_high:.1f} days"
     )
 
-    # Interpretation
-    if lead_time <= 7:
-        st.error(" **Critical:** Immediate churn risk (≤ 7 days)")
-    elif lead_time <= 30:
-        st.warning(" **Urgent:** Churn likely within 30 days")
-    else:
-        st.success(" **Stable:** No immediate churn expected")
+    # Interpretation using BOTH risk_state AND lead_time
+    if predicted_state == "Safe":
+        st.success(f"**Stable:** This user is in a healthy engagement state. "
+        f"No churn risk detected — lead-time prediction is not required. "
+        f"Continue standard service delivery.")
+    elif predicted_state == "At-Risk":
+        if lead_time <= 7:
+            st.error(f"**Critical:** Churn imminent — approximately {lead_time:.0f} days remaining")
+        elif lead_time <= 30:
+            st.error(f"⚠️ **Urgent:** Immediate intervention required — approximately {lead_time:.0f} days to churn")
+        else:
+            st.warning(f"**High Risk:** User is at-risk — approximately {lead_time:.0f} days to churn. Intervene now")
+
+    elif predicted_state == "Warning":
+        if lead_time <= 14:
+            st.warning(f"⚠️ **Escalating:** Rapid decline detected — approximately {lead_time:.0f} days to churn")
+        elif lead_time <= 30:
+            st.warning(f"**Moderate Risk:** Plan intervention soon — approximately {lead_time:.0f} days to churn")
+        else:
+            st.warning(f"**Early Warning:** Gradual decline detected — approximately {lead_time:.0f} days to potential churn. Monitor closely")
 
 else:
     st.info(
-        "Lead-time prediction is not applicable for low-risk users "
-        "(Safe users are treated as right-censored)."
+        "**Stable:** This user is in a healthy engagement state. "
+        "No churn risk detected — lead-time prediction is not required. "
+        "Continue standard service delivery."
     )
 
 
